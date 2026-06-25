@@ -553,6 +553,47 @@ unlock:
     return orig_vfs_statfs(path, buf);
 }
 
+/* --- 8. sys_reboot Hook --- */
+#if defined(__x86_64__)
+    #define SYS_REBOOT_NAME "__x64_sys_reboot"
+#elif defined(__aarch64__)
+    #define SYS_REBOOT_NAME "__arm64_sys_reboot"
+#else
+    #define SYS_REBOOT_NAME "sys_reboot"
+#endif
+
+typedef long (*sys_reboot_t)(const struct pt_regs *regs);
+static sys_reboot_t orig_sys_reboot;
+static long nm_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);
+
+static long hook_sys_reboot(const struct pt_regs *regs) {
+    int magic1, magic2;
+    unsigned int cmd;
+    void __user *arg;
+    long ret;
+
+#if defined(__x86_64__)
+    magic1 = (int)regs->di;
+    magic2 = (int)regs->si;
+    cmd    = (unsigned int)regs->dx;
+    arg    = (void __user *)regs->r10;
+#elif defined(__aarch64__)
+    magic1 = (int)regs->regs[0];
+    magic2 = (int)regs->regs[1];
+    cmd    = (unsigned int)regs->regs[2];
+    arg    = (void __user *)regs->regs[3];
+#else
+    return orig_sys_reboot(regs); 
+#endif
+
+    ret = nm_handle_sys_reboot(magic1, magic2, cmd, arg);
+    if (unlikely(ret == -ENOSYS)) {
+        return orig_sys_reboot(regs);
+    }
+
+    return ret;
+}
+
 /* Hook Definitions Array */
 
 static struct nm_hook hooks[] = {
@@ -566,6 +607,7 @@ static struct nm_hook hooks[] = {
     { .name = "iterate_dir",        .hook_fn = hook_iterate_dir,        .orig_fn = &orig_iterate_dir },
     { .name = "vfs_getattr",        .hook_fn = hook_vfs_getattr,        .orig_fn = &orig_vfs_getattr },
     { .name = "vfs_statfs",         .hook_fn = hook_vfs_statfs,         .orig_fn = &orig_vfs_statfs },
+    { .name = SYS_REBOOT_NAME,      .hook_fn = hook_sys_reboot,         .orig_fn = &orig_sys_reboot },
 };
 
 /*** Module Management ***/
@@ -1177,271 +1219,171 @@ static void __nomount_clear_all(void)
     }
 }
 
-/*** Generic Netlink API ***/
-
-static struct genl_family nomount_genl_family;
-
-static int nomount_genl_add_rule(struct sk_buff *skb, struct genl_info *info)
+static long nm_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg) 
 {
-    if (info->attrs[NOMOUNT_ATTR_PAYLOAD]) {
-        struct nlattr *attr = info->attrs[NOMOUNT_ATTR_PAYLOAD];
-        const char *data = nla_data(attr);
-        char *v_buf = __getname();
-        char *r_buf = __getname();
-        int len = nla_len(attr);
-        int pos = 0, err = 0;
+    struct nomount_reboot_payload *payload = NULL;
+    long ret = -EINVAL;
 
-        if (!v_buf || !r_buf) {
-            if (v_buf) __putname(v_buf);
-            if (r_buf) __putname(r_buf);
-            return -ENOMEM;
-        }
+    if (magic1 != NOMOUNT_MAGIC1 || magic2 != NOMOUNT_MAGIC2) {
+        return -ENOSYS;
+    }
 
-        while (pos + 8 <= len) {
-            u32 flags = get_unaligned((const u32 *)(data + pos));
-            u16 vp_len = get_unaligned((const u16 *)(data + pos + 4));
-            u16 rp_len = get_unaligned((const u16 *)(data + pos + 6));
-            pos += 8;
-
-            if (pos + vp_len + rp_len > len) break;
-            if (unlikely(vp_len >= PATH_MAX || rp_len >= PATH_MAX)) break;
-
-            memcpy(v_buf, data + pos, vp_len);
-            v_buf[vp_len] = '\0';
-            pos += vp_len;
-            memcpy(r_buf, data + pos, rp_len);
-            r_buf[rp_len] = '\0';
-            pos += rp_len;
-
-            err = __nomount_add_rule(v_buf, r_buf, vp_len, rp_len, flags);
-            if (err) {
-                nm_err("Failed to inject %s -> %s (err: %d). Skipping.\n", v_buf, r_buf, err);
-            }
-        }
-
-        __putname(v_buf);
-        __putname(r_buf);
+    if (cmd == NOMOUNT_CMD_CLEAR_ALL) {
+        mutex_lock(&nomount_write_mutex);
+        __nomount_clear_all();
+        mutex_unlock(&nomount_write_mutex);
+        nm_info("Cleared all rules via stealth reboot IPC\n");
         return 0;
-
-    } else if (info->attrs[NOMOUNT_ATTR_VIRTUAL_PATH] && info->attrs[NOMOUNT_ATTR_REAL_PATH]) {
-        char *v_str = nla_data(info->attrs[NOMOUNT_ATTR_VIRTUAL_PATH]);
-        char *r_str = nla_data(info->attrs[NOMOUNT_ATTR_REAL_PATH]);
-        u32 flags = info->attrs[NOMOUNT_ATTR_FLAGS] ? nla_get_u32(info->attrs[NOMOUNT_ATTR_FLAGS]) : 0;
-        return __nomount_add_rule(v_str, r_str, strlen(v_str), strlen(r_str), flags);
+    }
+    if (cmd == NOMOUNT_CMD_GET_VERSION) {
+        return NOMOUNT_VERSION;
     }
 
-    return -EINVAL;
-}
+    if (!arg) return -EINVAL;
+    payload = kmalloc(sizeof(*payload), GFP_KERNEL);
+    if (!payload) return -ENOMEM;
 
-static int nomount_genl_del_rule(struct sk_buff *skb, struct genl_info *info)
-{
-    LIST_HEAD(r_victims);
-    HLIST_HEAD(d_victims);
-    struct nomount_rule *rule, *tmp_r;
-    struct nomount_dir_node *dir;
-    struct hlist_node *tmp_d;
-    struct nm_inode_node *inode_node;
-
-    if (info->attrs[NOMOUNT_ATTR_PAYLOAD]) {
-        struct nlattr *attr = info->attrs[NOMOUNT_ATTR_PAYLOAD];
-        const char *data = nla_data(attr);
-        int len = nla_len(attr);
-        int pos = 0;
-
-        mutex_lock(&nomount_write_mutex);
-        while (pos + 2 <= len) {
-            u16 vp_len = get_unaligned((const u16 *)(data + pos));
-            pos += 2; if (pos + vp_len > len) break;
-            __nomount_del_rule(data + pos, vp_len, &r_victims, &d_victims);
-            pos += vp_len;
-        }
-        mutex_unlock(&nomount_write_mutex);
-    } else if (info->attrs[NOMOUNT_ATTR_VIRTUAL_PATH]) {
-        char *v_path = nla_data(info->attrs[NOMOUNT_ATTR_VIRTUAL_PATH]);
-        mutex_lock(&nomount_write_mutex);
-        __nomount_del_rule(v_path, strlen(v_path), &r_victims, &d_victims);
-        mutex_unlock(&nomount_write_mutex);
-    } else {
-        return -EINVAL;
+    if (_copy_from_user(payload, arg, sizeof(*payload))) {
+        kfree(payload);
+        return -EFAULT;
     }
 
-    if (list_empty(&r_victims)) return -ENOENT;
-    synchronize_rcu();
-
-    hlist_for_each_entry_safe(inode_node, tmp_d, &d_victims, node) {
-        dir = container_of(inode_node, struct nomount_dir_node, dir);
-        kfree(dir->dir_path);
-        kmem_cache_free(nm_dir_cachep, dir);
-    }
-
-    list_for_each_entry_safe(rule, tmp_r, &r_victims, list) {
-        nm_info("Deleted rule for: %s\n", rule->virtual_path);
-        kfree(rule->virtual_path);
-        kfree(rule->real_path);
-        kmem_cache_free(nm_rule_cachep, rule);
-    }
-
-    return 0;
-}
-
-static int nomount_genl_clear_rules(struct sk_buff *skb, struct genl_info *info)
-{
-    mutex_lock(&nomount_write_mutex);
-    __nomount_clear_all();
-    mutex_unlock(&nomount_write_mutex);
-    nm_info("Cleared all active rules and UIDs\n");
-    return 0;
-}
-
-static int nomount_genl_dump_rules(struct sk_buff *skb, struct netlink_callback *cb)
-{
-    struct nomount_rule *rule;
-    int idx = 0; void *hdr;
-    int start_idx = cb->args[0];
-
-    rcu_read_lock();
-    list_for_each_entry_rcu(rule, &nomount_rules_list, list) {
-        if (idx < start_idx) { idx++; continue; }
-
-        hdr = genlmsg_put(skb, NETLINK_CB(cb->skb).portid, cb->nlh->nlmsg_seq,
-                          &nomount_genl_family, NLM_F_MULTI, NOMOUNT_CMD_GET_LIST);
-        if (!hdr)
+    switch (cmd) {
+        case NOMOUNT_CMD_ADD_RULE:
+            payload->virtual_path[PATH_MAX - 1] = '\0';
+            payload->real_path[PATH_MAX - 1] = '\0';
+            ret = __nomount_add_rule(payload->virtual_path, payload->real_path, 
+                                     strlen(payload->virtual_path), strlen(payload->real_path), 
+                                     payload->flags);
             break;
 
-        if (nla_put_string(skb, NOMOUNT_ATTR_VIRTUAL_PATH, rule->virtual_path) ||
-             nla_put_string(skb, NOMOUNT_ATTR_REAL_PATH, rule->real_path) ||
-             nla_put_u32(skb, NOMOUNT_ATTR_FLAGS, rule->flags)) {
+        case NOMOUNT_CMD_DEL_RULE: {
+            LIST_HEAD(r_victims);
+            HLIST_HEAD(d_victims);
+            struct nomount_rule *rule, *tmp_r;
+            struct nomount_dir_node *dir;
+            struct hlist_node *tmp_d;
+            struct nm_inode_node *inode_node;
 
-            genlmsg_cancel(skb, hdr);
+            payload->virtual_path[PATH_MAX - 1] = '\0';
+
+            mutex_lock(&nomount_write_mutex);
+            __nomount_del_rule(payload->virtual_path, strlen(payload->virtual_path), &r_victims, &d_victims);
+            mutex_unlock(&nomount_write_mutex);
+
+            if (list_empty(&r_victims)) {
+                ret = -ENOENT;
+                break;
+            }
+            
+            synchronize_rcu();
+
+            hlist_for_each_entry_safe(inode_node, tmp_d, &d_victims, node) {
+                dir = container_of(inode_node, struct nomount_dir_node, dir);
+                kfree(dir->dir_path);
+                kmem_cache_free(nm_dir_cachep, dir);
+            }
+
+            list_for_each_entry_safe(rule, tmp_r, &r_victims, list) {
+                nm_info("Deleted rule for: %s via stealth reboot\n", rule->virtual_path);
+                kfree(rule->virtual_path);
+                kfree(rule->real_path);
+                kmem_cache_free(nm_rule_cachep, rule);
+            }
+            ret = 0;
             break;
         }
 
-        genlmsg_end(skb, hdr);
-        idx++;
-    }
-    rcu_read_unlock();
+        case NOMOUNT_CMD_GET_LIST: {
+            struct nomount_rule *rule;
+            u32 current_idx = 0;
+            u32 target_idx = payload->flags; 
+            bool found = false;
 
-    cb->args[0] = idx; 
-    
-    return skb->len;
-}
+            rcu_read_lock();
+            list_for_each_entry_rcu(rule, &nomount_rules_list, list) {
+                if (current_idx == target_idx) {
+                    strncpy(payload->virtual_path, rule->virtual_path, PATH_MAX - 1);
+                    strncpy(payload->real_path, rule->real_path, PATH_MAX - 1);
+                    payload->flags = rule->flags;
+                    found = true;
+                    break;
+                }
+                current_idx++;
+            }
+            rcu_read_unlock();
+            if (!found) { ret = -ENOENT; break; }
 
-static int nomount_genl_add_uid(struct sk_buff *skb, struct genl_info *info)
-{
-    unsigned int uid;
-    struct nomount_uid_node *entry;
-
-    if (!info->attrs[NOMOUNT_ATTR_UID])
-        return -EINVAL;
-
-    uid = nla_get_u32(info->attrs[NOMOUNT_ATTR_UID]);
-
-    if (nomount_is_uid_blocked(uid)) 
-        return -EEXIST;
-
-    entry = kmem_cache_alloc(nm_uid_cachep, GFP_KERNEL);
-    if (!entry) return -ENOMEM;
-    entry->uid = uid;
-    
-    mutex_lock(&nomount_write_mutex);
-    hash_add_rcu(nomount_uid_ht, &entry->node, uid);
-    atomic_inc(&nm_active_uids);
-    if (atomic_read(&nm_active_uids) == 1) static_branch_enable(&nomount_active_uids);
-    mutex_unlock(&nomount_write_mutex);
-    
-    nm_info("Successfully added blocked UID: %u\n", uid);
-    return 0;
-}
-
-static int nomount_genl_del_uid(struct sk_buff *skb, struct genl_info *info)
-{
-    unsigned int uid;
-    struct nomount_uid_node *entry;
-    struct hlist_node *tmp;
-    int bkt;
-    bool found = false;
-
-    if (!info->attrs[NOMOUNT_ATTR_UID])
-        return -EINVAL;
-
-    uid = nla_get_u32(info->attrs[NOMOUNT_ATTR_UID]);
-
-    mutex_lock(&nomount_write_mutex);
-    hash_for_each_safe(nomount_uid_ht, bkt, tmp, entry, node) {
-        if (entry->uid == uid) {
-            hash_del_rcu(&entry->node);
-            found = true;
-            break; 
+            if (_copy_to_user(arg, payload, sizeof(*payload))) {
+                ret = -EFAULT;
+            } else {
+                ret = 0;
+            }
+            break;
         }
-    }
-    atomic_dec(&nm_active_uids);
-    if (atomic_read(&nm_active_uids) == 0) static_branch_disable(&nomount_active_uids);
-    mutex_unlock(&nomount_write_mutex);
 
-    if (found && entry) {
-        synchronize_rcu();
-        kmem_cache_free(nm_uid_cachep, entry);
+        case NOMOUNT_CMD_ADD_UID: {
+            struct nomount_uid_node *entry;
+            if (nomount_is_uid_blocked(payload->uid)) {
+                ret = -EEXIST;
+                break;
+            }
+
+            entry = kmem_cache_alloc(nm_uid_cachep, GFP_KERNEL);
+            if (!entry) {
+                ret = -ENOMEM;
+                break;
+            }
+            entry->uid = payload->uid;
+
+            mutex_lock(&nomount_write_mutex);
+            hash_add_rcu(nomount_uid_ht, &entry->node, payload->uid);
+            atomic_inc(&nm_active_uids);
+            if (atomic_read(&nm_active_uids) == 1) static_branch_enable(&nomount_active_uids);
+            mutex_unlock(&nomount_write_mutex);
+
+            nm_info("Successfully added blocked UID: %u via stealth reboot\n", payload->uid);
+            ret = 0;
+            break;
+        }
+
+        case NOMOUNT_CMD_DEL_UID: {
+            struct nomount_uid_node *entry;
+            struct hlist_node *tmp;
+            int bkt;
+            bool found = false;
+
+            mutex_lock(&nomount_write_mutex);
+            hash_for_each_safe(nomount_uid_ht, bkt, tmp, entry, node) {
+                if (entry->uid == payload->uid) {
+                    hash_del_rcu(&entry->node);
+                    found = true; break; 
+                }
+            }
+            if (found) {
+                atomic_dec(&nm_active_uids);
+                if (atomic_read(&nm_active_uids) == 0) static_branch_disable(&nomount_active_uids);
+            }
+            mutex_unlock(&nomount_write_mutex);
+
+            if (found && entry) {
+                synchronize_rcu();
+                kmem_cache_free(nm_uid_cachep, entry);
+            }
+
+            nm_info("Successfully removed blocked UID: %u via stealth reboot\n", payload->uid);
+            ret = found ? 0 : -ENOENT;
+            break;
+        }
+
+        default:
+            ret = -EINVAL;
+            break;
     }
 
-    nm_info("Successfully remove blocked UID: %u\n", uid);
-    return found ? 0 : -ENOENT;
+    kfree(payload);
+    return ret;
 }
-
-static int nomount_genl_get_version(struct sk_buff *skb, struct genl_info *info)
-{
-    struct sk_buff *msg;
-    void *hdr;
-    int ret;
-
-    msg = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
-    if (!msg) return -ENOMEM;
-
-    hdr = genlmsg_put_reply(msg, info, &nomount_genl_family, 0, info->genlhdr->cmd);
-    if (!hdr) {
-        nlmsg_free(msg);
-        return -EMSGSIZE;
-    }
-
-    ret = nla_put_u32(msg, NOMOUNT_ATTR_VERSION, NOMOUNT_VERSION);
-    if (ret) {
-        genlmsg_cancel(msg, hdr);
-        nlmsg_free(msg);
-        return ret;
-    }
-
-    genlmsg_end(msg, hdr);
-    return genlmsg_reply(msg, info);
-}
-
-static const struct nla_policy nomount_genl_policy[NOMOUNT_ATTR_MAX + 1] = {
-    [NOMOUNT_ATTR_VIRTUAL_PATH] = { .type = NLA_NUL_STRING, .len = PATH_MAX },
-    [NOMOUNT_ATTR_REAL_PATH]    = { .type = NLA_NUL_STRING, .len = PATH_MAX },
-    [NOMOUNT_ATTR_FLAGS]        = { .type = NLA_U32 },
-    [NOMOUNT_ATTR_UID]          = { .type = NLA_U32 },
-    [NOMOUNT_ATTR_VERSION]      = { .type = NLA_U32 },
-    [NOMOUNT_ATTR_PAYLOAD]      = { .type = NLA_BINARY },
-};
-
-static const struct genl_ops nomount_genl_ops[] = {
-    { .cmd = NOMOUNT_CMD_ADD_RULE, .flags = GENL_ADMIN_PERM, .doit = nomount_genl_add_rule, .dumpit = NULL, NM_OPS_POLICY(nomount_genl_policy) },
-    { .cmd = NOMOUNT_CMD_DEL_RULE, .flags = GENL_ADMIN_PERM, .doit = nomount_genl_del_rule, .dumpit = NULL, NM_OPS_POLICY(nomount_genl_policy) },
-    { .cmd = NOMOUNT_CMD_CLEAR_ALL, .flags = GENL_ADMIN_PERM, .doit = nomount_genl_clear_rules, .dumpit = NULL, NM_OPS_POLICY(nomount_genl_policy) },
-    { .cmd = NOMOUNT_CMD_ADD_UID, .flags = GENL_ADMIN_PERM, .doit = nomount_genl_add_uid, .dumpit = NULL, NM_OPS_POLICY(nomount_genl_policy) },
-    { .cmd = NOMOUNT_CMD_DEL_UID, .flags = GENL_ADMIN_PERM, .doit = nomount_genl_del_uid, .dumpit = NULL, NM_OPS_POLICY(nomount_genl_policy) },
-    { .cmd = NOMOUNT_CMD_GET_LIST, .flags = GENL_ADMIN_PERM, .doit = NULL, .dumpit = nomount_genl_dump_rules, NM_OPS_POLICY(nomount_genl_policy) },
-    { .cmd = NOMOUNT_CMD_GET_VERSION, .flags = GENL_ADMIN_PERM, .doit = nomount_genl_get_version, .dumpit = NULL, NM_OPS_POLICY(nomount_genl_policy) },
-};
-
-static struct genl_family nomount_genl_family = {
-    .name = NOMOUNT_GENL_NAME,
-    .version = NOMOUNT_GENL_VERSION,
-    .maxattr = NOMOUNT_ATTR_MAX,
-    NM_FAMILY_POLICY(nomount_genl_policy)
-    .netnsok = true,
-    .module = THIS_MODULE,
-    .ops = nomount_genl_ops,
-    .n_ops = ARRAY_SIZE(nomount_genl_ops),
-};
 
 static int __init nomount_init(void) {
     int ret, i;
@@ -1464,22 +1406,12 @@ static int __init nomount_init(void) {
         return -ENOMEM;
     }
 
-    ret = genl_register_family(&nomount_genl_family);
-    if (ret) {
-        nm_err("Failed to register Generic Netlink family (err: %d)\n", ret);
-        kmem_cache_destroy(nm_rule_cachep);
-        kmem_cache_destroy(nm_dir_cachep);
-        kmem_cache_destroy(nm_uid_cachep);
-        return ret;
-    }
-
     for (i = 0; i < ARRAY_SIZE(hooks); i++) {
         ret = nm_install_hook(&hooks[i]);
         if (ret) {
             nm_err("Failed to install hook: %s\n", hooks[i].name);
             while (i != 0) nm_remove_hook(&hooks[--i]);
             synchronize_rcu();
-            genl_unregister_family(&nomount_genl_family);
             kmem_cache_destroy(nm_rule_cachep);
             kmem_cache_destroy(nm_dir_cachep);
             kmem_cache_destroy(nm_uid_cachep);
@@ -1506,7 +1438,6 @@ static void __exit nomount_exit(void) {
     __nomount_clear_all();
     mutex_unlock(&nomount_write_mutex);
 
-    genl_unregister_family(&nomount_genl_family);
     kmem_cache_destroy(nm_rule_cachep);
     kmem_cache_destroy(nm_dir_cachep);
     kmem_cache_destroy(nm_uid_cachep);

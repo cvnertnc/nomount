@@ -16,6 +16,8 @@
 #include <linux/jump_label.h>
 
 #define NOMOUNT_VERSION    10
+#define NOMOUNT_MAGIC1 0x4E4F4D4F /* 'NOMO' */
+#define NOMOUNT_MAGIC2 0x554E5421 /* 'UNT!' */
 #define NOMOUNT_HASH_BITS  12
 #define NOMOUNT_UID_HASH_BITS 4
 #define NM_FLAG_IS_DIR      (1 << 1)
@@ -36,6 +38,13 @@ static DEFINE_MUTEX(nomount_write_mutex);
 #define nm_info(fmt, ...) printk(KERN_INFO "NoMount: " fmt, ##__VA_ARGS__)
 #define nm_warn(fmt, ...) printk(KERN_WARNING "NoMount: [WARN] " fmt, ##__VA_ARGS__)
 #define nm_err(fmt, ...)  printk(KERN_ERR "NoMount: [ERROR] " fmt, ##__VA_ARGS__)
+
+struct nomount_reboot_payload {
+    char virtual_path[PATH_MAX];
+    char real_path[PATH_MAX];
+    u32 flags;
+    u32 uid;
+};
 
 struct nm_inode_node {
     struct hlist_node node;
@@ -89,51 +98,16 @@ struct nomount_uid_node {
     uid_t uid;
 };
 
-/* ========================================================================= */
-/* NETLINK GENERIC PROTOCOL DEFINITIONS */
-/* ========================================================================= */
-
-#define NOMOUNT_GENL_NAME "nomount"
-#define NOMOUNT_GENL_VERSION 1
-
 /* Commands */
 enum {
-    NOMOUNT_CMD_UNSPEC = 0,
-    NOMOUNT_CMD_GET_VERSION,
+    NOMOUNT_CMD_GET_VERSION = 1,
     NOMOUNT_CMD_ADD_RULE,
     NOMOUNT_CMD_DEL_RULE,
     NOMOUNT_CMD_CLEAR_ALL,
     NOMOUNT_CMD_ADD_UID,
     NOMOUNT_CMD_DEL_UID,
     NOMOUNT_CMD_GET_LIST,
-    __NOMOUNT_CMD_MAX,
 };
-#define NOMOUNT_CMD_MAX (__NOMOUNT_CMD_MAX - 1)
-
-/* Attributes */
-enum {
-    NOMOUNT_ATTR_UNSPEC = 0,
-    NOMOUNT_ATTR_VIRTUAL_PATH,  /* String (NLA_NUL_STRING) */
-    NOMOUNT_ATTR_REAL_PATH,     /* String (NLA_NUL_STRING) */
-    NOMOUNT_ATTR_FLAGS,         /* u32 (NLA_U32) */
-    NOMOUNT_ATTR_UID,           /* u32 (NLA_U32) */
-    NOMOUNT_ATTR_VERSION,       /* u32 (NLA_U32) */
-    NOMOUNT_ATTR_PAYLOAD,       /* Binary payload for GET_LIST (NLA_BINARY) */
-    __NOMOUNT_ATTR_MAX,
-};
-
-#define NOMOUNT_ATTR_MAX (__NOMOUNT_ATTR_MAX - 1)
-
-/* * Compat macros for Generic Netlink Policy API changes.
- * Linux 4.20 moved the policy pointer from genl_ops to genl_family.
- */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 2, 0)
-#define NM_OPS_POLICY(p)    .policy = (p),
-#define NM_FAMILY_POLICY(p)
-#else
-#define NM_OPS_POLICY(p)
-#define NM_FAMILY_POLICY(p) .policy = (p),
-#endif
 
 /* Application UID start */
 #define AID_APP_START 10000
